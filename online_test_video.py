@@ -37,17 +37,39 @@ def weighting_func(x):
 
 opt = parse_opts_online()
 
-# ── Device selection (CUDA → MPS → CPU) ──────────────────────────────────────
-if torch.cuda.is_available() and not opt.no_cuda:
-    device = torch.device('cuda')
-else:
-    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = torch.device('mps')
-    else:
-        device = torch.device('cpu')
+def _select_device(opt):
+    """Prefer CUDA, otherwise default to CPU on macOS unless MPS is explicitly requested."""
+    if torch.cuda.is_available() and not opt.no_cuda:
+        print('Using device: cuda')
+        return torch.device('cuda')
+
+    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+    use_mps = os.environ.get('REALTIME_GESREC_USE_MPS', '0') == '1'
+    if mps_available and use_mps:
+        os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+        print('Using device: mps (fallback enabled for unsupported ops)')
+        return torch.device('mps')
+
+    if mps_available:
+        print('MPS is available, but using CPU because some 3D ops used by this model are not implemented on MPS.')
+
+    print('Using device: cpu')
+    return torch.device('cpu')
+
+
+device = _select_device(opt)
+if device.type != 'cuda':
     opt.no_cuda = True  # tell generate_model not to call .cuda() / DataParallel
 
-print('Using device:', device)
+
+def _open_video_capture(video_source):
+    """Open a webcam or stream with a macOS-friendly backend when possible."""
+    if isinstance(video_source, int) and hasattr(cv2, 'CAP_AVFOUNDATION'):
+        cap = cv2.VideoCapture(video_source, cv2.CAP_AVFOUNDATION)
+        if cap.isOpened():
+            return cap
+
+    return cv2.VideoCapture(video_source)
 
 
 def _load_checkpoint(model, path):
@@ -181,7 +203,10 @@ fps = ""
 
 # Support both webcam index ("0") and file paths.
 _video_src = int(opt.video) if str(opt.video).isdigit() else opt.video
-cap = cv2.VideoCapture(_video_src)
+cap = _open_video_capture(_video_src)
+
+if not cap.isOpened():
+    raise RuntimeError('Could not open video source: {}. On macOS, try iPhone Continuity Camera, Camo, or an IP camera URL.'.format(opt.video))
 
 """
 # On Linux the FFMPEG backend can't enumerate cameras; force V4L2 for indices.
@@ -215,6 +240,11 @@ spatial_transform.randomize_parameters()
 while cap.isOpened():
     t1 = time.time()
     ret, frame = cap.read()
+    if not ret or frame is None:
+        if num_frame == 0:
+            raise RuntimeError('Video source opened but no frames were received from: {}'.format(opt.video))
+        break
+
     if num_frame == 0:
         cur_frame = cv2.resize(frame,(320,240))
         cur_frame = Image.fromarray(cv2.cvtColor(cur_frame,cv2.COLOR_BGR2RGB))
@@ -262,8 +292,7 @@ while cap.isOpened():
         
         #### State of the detector is checked here as detector act as a switch for the classifier
         if prediction_det == 1:
-            inputs_clf = inputs[:, :, :, :, :]
-            inputs_clf = torch.Tensor(inputs_clf.numpy()[:,:,::1,:,:])
+            inputs_clf = inputs.clone()
             outputs_clf = classifier(inputs_clf)
             outputs_clf = F.softmax(outputs_clf, dim=1)
             outputs_clf = outputs_clf.cpu().numpy()[0].reshape(-1, )
@@ -363,5 +392,6 @@ while cap.isOpened():
 
     if cv2.waitKey(1)&0xFF == ord('q'):
         break
+cap.release()
 cv2.destroyAllWindows()
 

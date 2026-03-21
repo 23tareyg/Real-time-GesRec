@@ -18,7 +18,7 @@ VIDEO="${1:-0}"
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-python3 online_test_video.py \
+python3 online_test_video_laptop.py \
     --root_path "" \
     --video         "${VIDEO}" \
     --annotation_path "${REPO_DIR}/annotation_EgoGesture/egogestureall.json" \
