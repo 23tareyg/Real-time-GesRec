@@ -180,6 +180,10 @@ if os.path.exists(_cat_file):
 fps = ""
 
 # Support both webcam index ("0") and file paths.
+_video_src = int(opt.video) if str(opt.video).isdigit() else opt.video
+cap = cv2.VideoCapture(_video_src)
+
+"""
 # On Linux the FFMPEG backend can't enumerate cameras; force V4L2 for indices.
 if str(opt.video).isdigit():
     _video_src = int(opt.video)
@@ -188,6 +192,7 @@ if str(opt.video).isdigit():
         cap = cv2.VideoCapture(_video_src)
 else:
     cap = cv2.VideoCapture(opt.video)
+"""
 
 num_frame = 0
 clip = []
