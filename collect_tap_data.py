@@ -5,23 +5,23 @@ Real-time pointer-thumb tap data collection using MediaPipe Hands.
 
 Controls
 ────────
-  SPACE  – hold to mark frames as tap active (label = 1)
-  S      – start / resume recording (default: starts immediately)
-  P      – pause recording without quitting
-  Q      – quit and save CSV
+  SPACE  hold to mark frames as tap active (label = 1)
+  S start / resume recording (default: starts immediately)
+  P pause recording without quitting
+  Q quit and save CSV
 
 Output CSV columns
 ──────────────────
-  frame_idx   – monotone frame counter
-  timestamp   – seconds since start
-  dist_raw    – Euclidean distance (in image pixels) between thumb tip (4)
+  frame_idx    monotone frame counter
+  timestamp    seconds since start
+  dist_raw     Euclidean distance (in image pixels) between thumb tip (4)
                 and index finger tip (8)
-  dist_norm   – dist_raw normalised by palm size
+  dist_norm    dist_raw normalised by palm size
                 (distance between wrist (0) and middle-finger MCP (9))
-  velocity    – finite-difference of dist_norm over 1 frame
-  accel       – finite-difference of velocity over 1 frame
-  hand_conf   – MediaPipe detection confidence for the tracked hand
-  label       – 1 while spacebar is held, 0 otherwise
+  velocity     finite-difference of dist_norm over 1 frame
+  accel        finite-difference of velocity over 1 frame
+  hand_conf    MediaPipe detection confidence for the tracked hand
+  label        1 while spacebar is held, 0 otherwise
 
 Usage
 ─────
@@ -39,11 +39,29 @@ import math
 import os
 import sys
 import time
+import urllib.request
 from collections import deque
 
 import cv2
-import mediapipe as mp
 import numpy as np
+
+import mediapipe as mp
+
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)
+]
+
+
+DEFAULT_TASK_MODEL_URL = (
+    'https://storage.googleapis.com/mediapipe-models/hand_landmarker/'
+    'hand_landmarker/float16/1/hand_landmarker.task'
+)
+DEFAULT_TASK_MODEL_PATH = os.path.join('models', 'hand_landmarker.task')
 
 
 # ── Landmark indices of interest ─────────────────────────────────────────────
@@ -76,6 +94,10 @@ def parse_args():
                    help='MediaPipe min tracking confidence (default: 0.5)')
     p.add_argument('--paused', action='store_true',
                    help='Start in paused state (press S to begin recording)')
+    p.add_argument('--hand_model', default=DEFAULT_TASK_MODEL_PATH,
+                   help='Path to hand_landmarker.task model file')
+    p.add_argument('--no_model_download', action='store_true',
+                   help='Do not auto-download hand_landmarker.task if missing')
     return p.parse_args()
 
 
@@ -83,8 +105,16 @@ def open_capture(source: str):
     """Open a cv2.VideoCapture from a string that is either a digit or a path."""
     if source.isdigit():
         idx = int(source)
+        if sys.platform == 'darwin' and hasattr(cv2, 'CAP_AVFOUNDATION'):
+            cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
+            if cap.isOpened():
+                return cap
+
         # On Linux, try V4L2 first to avoid FFMPEG camera enumeration issues
-        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        if hasattr(cv2, 'CAP_V4L2'):
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        else:
+            cap = cv2.VideoCapture(idx)
         if not cap.isOpened():
             cap = cv2.VideoCapture(idx)
     else:
@@ -92,36 +122,76 @@ def open_capture(source: str):
     return cap
 
 
+def ensure_task_model(model_path: str, no_download: bool):
+    """Ensure the MediaPipe Tasks hand model exists, optionally downloading it."""
+    if os.path.exists(model_path):
+        return model_path
+
+    if no_download:
+        raise FileNotFoundError(
+            f'Hand model not found: {model_path}. '
+            f'Download from: {DEFAULT_TASK_MODEL_URL}'
+        )
+
+    os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
+    print(f'Downloading hand model to: {model_path}')
+    urllib.request.urlretrieve(DEFAULT_TASK_MODEL_URL, model_path)
+    return model_path
+
+
+def create_hand_landmarker(args):
+    model_path = ensure_task_model(args.hand_model, args.no_model_download)
+
+    base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+    options = mp.tasks.vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        num_hands=args.max_hands,
+        min_hand_detection_confidence=args.min_det_conf,
+        min_hand_presence_confidence=args.min_track_conf,
+        min_tracking_confidence=args.min_track_conf,
+    )
+    return mp.tasks.vision.HandLandmarker.create_from_options(options)
+
+
 def select_hand(results, preference: str):
     """Return the landmark list of the preferred hand, or None."""
-    if results.multi_hand_landmarks is None:
+    if not results.hand_landmarks:
         return None, None
 
-    hand_labels = []
-    if results.multi_handedness:
-        hand_labels = [h.classification[0].label.lower()   # 'left' or 'right'
-                       for h in results.multi_handedness]
-
-    for i, lm in enumerate(results.multi_hand_landmarks):
-        label = hand_labels[i] if i < len(hand_labels) else 'unknown'
-        conf  = (results.multi_handedness[i].classification[0].score
-                 if results.multi_handedness else 0.0)
+    for i, lm in enumerate(results.hand_landmarks):
+        label = 'unknown'
+        conf = 0.0
+        if i < len(results.handedness) and results.handedness[i]:
+            handed = results.handedness[i][0]
+            label = handed.category_name.lower()
+            conf = handed.score
         if preference == 'any' or label == preference:
             return lm, conf
 
     return None, None
 
 
+def draw_hand_skeleton(frame, lm, w, h):
+    """Draw hand landmarks and skeletal connections for MediaPipe Tasks output."""
+    for i, j in HAND_CONNECTIONS:
+        xi, yi = int(lm[i].x * w), int(lm[i].y * h)
+        xj, yj = int(lm[j].x * w), int(lm[j].y * h)
+        cv2.line(frame, (xi, yi), (xj, yj), (0, 220, 220), 1)
+
+    for p in lm:
+        x, y = int(p.x * w), int(p.y * h)
+        cv2.circle(frame, (x, y), 2, (255, 255, 255), -1)
+
+
 def draw_overlay(frame, lm, h, w, dist_raw, dist_norm, vel, accel,
                  label, recording, paused, frame_idx, fps_str):
     """Draw landmarks, distance line, and HUD onto the frame (in-place)."""
-    mp_draw = mp.solutions.drawing_utils
-    mp_hands = mp.solutions.hands
-    mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
+    draw_hand_skeleton(frame, lm, w, h)
 
     # Thumb tip and index tip pixel coords
-    t  = lm.landmark[THUMB_TIP]
-    ix = lm.landmark[INDEX_TIP]
+    t  = lm[THUMB_TIP]
+    ix = lm[INDEX_TIP]
     tx, ty = int(t.x * w),  int(t.y * h)
     ix_, iy = int(ix.x * w), int(ix.y * h)
 
@@ -166,18 +236,14 @@ def main():
     if not cap.isOpened():
         sys.exit(f'ERROR: Could not open video source "{args.source}"')
 
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        max_num_hands=args.max_hands,
-        min_detection_confidence=args.min_det_conf,
-        min_tracking_confidence=args.min_track_conf,
-    )
+    hand_landmarker = create_hand_landmarker(args)
 
     # ── State ─────────────────────────────────────────────────────────────────
     recording  = not args.paused
     paused     = args.paused
     frame_idx  = 0
     rows       = []
+    start_time = time.time()
 
     # Sliding history for velocity / acceleration (normalised distance)
     hist = deque(maxlen=3)   # stores last 3 dist_norm values
@@ -206,9 +272,8 @@ def main():
 
         # ── MediaPipe inference ───────────────────────────────────────────────
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = hands.process(rgb)
-        rgb.flags.writeable = True
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results = hand_landmarker.detect(mp_image)
 
         # ── Key handling (non-blocking) ───────────────────────────────────────
         key = cv2.waitKey(1) & 0xFF
@@ -254,10 +319,10 @@ def main():
         dist_norm = 0.0
 
         if lm is not None:
-            thumb     = lm.landmark[THUMB_TIP]
-            index_tip = lm.landmark[INDEX_TIP]
-            wrist     = lm.landmark[WRIST]
-            mid_mcp   = lm.landmark[MID_MCP]
+            thumb     = lm[THUMB_TIP]
+            index_tip = lm[INDEX_TIP]
+            wrist     = lm[WRIST]
+            mid_mcp   = lm[MID_MCP]
 
             dist_raw  = _dist(thumb, index_tip, w, h)
             palm_size = _dist(wrist, mid_mcp, w, h)
@@ -280,7 +345,7 @@ def main():
         if recording and not paused and lm is not None:
             rows.append({
                 'frame_idx':  frame_idx,
-                'timestamp':  round(time.time() - fps_t0, 4),
+                'timestamp':  round(time.time() - start_time, 4),
                 'dist_raw':   round(dist_raw,  4),
                 'dist_norm':  round(dist_norm, 6),
                 'velocity':   round(vel,        6),
@@ -302,7 +367,7 @@ def main():
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     cap.release()
-    hands.close()
+    hand_landmarker.close()
     cv2.destroyAllWindows()
 
     if not rows:
