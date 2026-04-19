@@ -12,6 +12,7 @@ Controls
 
 Output CSV columns
 ──────────────────
+    session_id   recording session identifier (same for all rows in one run)
   frame_idx    monotone frame counter
   timestamp    seconds since start
   dist_raw     Euclidean distance (in image pixels) between thumb tip (4)
@@ -31,6 +32,7 @@ Usage
   python collect_tap_data.py --source 1              # camera index 1
   python collect_tap_data.py --hand left             # track left hand
   python collect_tap_data.py --mirror                # flip webcam image
+    python collect_tap_data.py --session_id s01        # explicit session id
 """
 
 import argparse
@@ -98,6 +100,8 @@ def parse_args():
                    help='Path to hand_landmarker.task model file')
     p.add_argument('--no_model_download', action='store_true',
                    help='Do not auto-download hand_landmarker.task if missing')
+    p.add_argument('--session_id', default=None,
+                   help='Optional session id to store in CSV (default: inferred from --out)')
     return p.parse_args()
 
 
@@ -232,6 +236,10 @@ def draw_overlay(frame, lm, h, w, dist_raw, dist_norm, vel, accel,
 def main():
     args = parse_args()
 
+    session_id = args.session_id
+    if session_id is None or str(session_id).strip() == '':
+        session_id = os.path.splitext(os.path.basename(args.out))[0]
+
     cap = open_capture(args.source)
     if not cap.isOpened():
         sys.exit(f'ERROR: Could not open video source "{args.source}"')
@@ -256,6 +264,7 @@ def main():
 
     print('─' * 50)
     print(f'Collecting to: {args.out}')
+    print(f'Session ID: {session_id}')
     print('Controls: SPACE=tap label  S=start/stop rec  P=pause  Q=quit')
     print('─' * 50)
 
@@ -299,7 +308,7 @@ def main():
             label = 1
 
         # cv2.waitKey(1) only gives us the most recent press → to simulate
-        # "hold spacebar", we query the keyboard state via a small trick:
+        # "use space to toggle", we query the keyboard state via a small trick:
         # re-poll with waitKey(0) for 1 ms — but that blocks. Instead we rely
         # on the user pressing space EACH frame (common at 15-30 fps it works),
         # OR they can use an alternate approach: toggle mode.
@@ -344,6 +353,7 @@ def main():
         # ── Record row ────────────────────────────────────────────────────────
         if recording and not paused and lm is not None:
             rows.append({
+                'session_id': session_id,
                 'frame_idx':  frame_idx,
                 'timestamp':  round(time.time() - start_time, 4),
                 'dist_raw':   round(dist_raw,  4),
@@ -376,7 +386,7 @@ def main():
 
     out_path = args.out
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    fieldnames = ['frame_idx', 'timestamp', 'dist_raw', 'dist_norm',
+    fieldnames = ['session_id', 'frame_idx', 'timestamp', 'dist_raw', 'dist_norm',
                   'velocity', 'accel', 'hand_conf', 'label']
     with open(out_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

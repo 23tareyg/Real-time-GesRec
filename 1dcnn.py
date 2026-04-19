@@ -14,7 +14,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 @dataclass
 class Config:
     # Update path to your path
-    csv_path: str = r"C:\Users\dohun\OneDrive - Virginia Tech\Documents\ECE 4524\test.csv"
+    csv_path: str = "./tap_data"
     window_size: int = 30
     stride: int = 1
     batch_size: int = 128
@@ -31,6 +31,7 @@ class Config:
     test_size: float = 0.2
     random_state: int = 4524
     use_weighted_loss: bool = True
+    split_by_session: bool = True
     save_path: str = "best_1dcnn_tap.pt"
     device: str = "cpu"
 
@@ -108,6 +109,11 @@ def load_and_validate_csv(csv_path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing columns: {missing}")
 
+    if "session_id" not in df.columns:
+        df["session_id"] = Path(csv_path).stem
+
+    df["session_id"] = df["session_id"].astype(str)
+
     df = df.sort_values(by=["frame_idx"]).reset_index(drop=True)
 
     for col in required_columns:
@@ -121,6 +127,21 @@ def load_and_validate_csv(csv_path: str) -> pd.DataFrame:
         raise ValueError("Label column must contain only 0 or 1.")
 
     return df
+
+
+def load_and_validate_csvs(csv_paths):
+    frames = []
+    for path in csv_paths:
+        df = load_and_validate_csv(path)
+        if "session_id" not in df.columns:
+            df["session_id"] = Path(path).stem
+        df["session_id"] = df["session_id"].fillna(Path(path).stem).astype(str)
+        frames.append(df)
+
+    if not frames:
+        raise ValueError("No CSV files were loaded.")
+
+    return pd.concat(frames, ignore_index=True)
 
 # Converts repeated 1s into single event points
 def collapse_positive_runs_to_single_event(labels: np.ndarray) -> np.ndarray:
@@ -143,26 +164,49 @@ def collapse_positive_runs_to_single_event(labels: np.ndarray) -> np.ndarray:
 
 # Creates sliding windows and assigns labels
 def create_sliding_windows(df, feature_columns, label_column, window_size, stride):
-    X = df[feature_columns].values.astype(np.float32)
-    raw_y = df[label_column].values.astype(int)
-
-    event_y = collapse_positive_runs_to_single_event(raw_y)
-
     X_windows = []
     y_windows = []
+    window_session_ids = []
 
-    for start in range(0, len(df) - window_size + 1, stride):
-        end = start + window_size
-        window_x = X[start:end]
-        window_y = 1 if np.any(event_y[start:end] == 1) else 0
+    raw_positive_frames = 0
+    collapsed_tap_events = 0
 
-        X_windows.append(window_x)
-        y_windows.append(window_y)
+    grouped = df.groupby("session_id", sort=False)
+    for session_id, session_df in grouped:
+        session_df = session_df.sort_values(by=["frame_idx"]).reset_index(drop=True)
+
+        X = session_df[feature_columns].values.astype(np.float32)
+        raw_y = session_df[label_column].values.astype(int)
+        event_y = collapse_positive_runs_to_single_event(raw_y)
+
+        raw_positive_frames += int(np.sum(raw_y == 1))
+        collapsed_tap_events += int(np.sum(event_y == 1))
+
+        if len(session_df) < window_size:
+            continue
+
+        for start in range(0, len(session_df) - window_size + 1, stride):
+            end = start + window_size
+            window_x = X[start:end]
+            window_y = 1 if np.any(event_y[start:end] == 1) else 0
+
+            X_windows.append(window_x)
+            y_windows.append(window_y)
+            window_session_ids.append(session_id)
 
     X_windows = np.array(X_windows, dtype=np.float32)
     y_windows = np.array(y_windows, dtype=np.float32)
+    window_session_ids = np.array(window_session_ids)
 
-    return X_windows, y_windows, raw_y, event_y
+    stats = {
+        "num_rows": len(df),
+        "raw_positive_frames": raw_positive_frames,
+        "collapsed_tap_events": collapsed_tap_events,
+        "num_sessions": int(df["session_id"].nunique()) if len(df) else 0,
+        "sessions_with_windows": int(len(np.unique(window_session_ids))) if len(window_session_ids) else 0,
+    }
+
+    return X_windows, y_windows, window_session_ids, stats
 
 # Standardizes feature values using training data
 def standardize_windows(X_train, X_test):
@@ -180,6 +224,35 @@ def standardize_windows(X_train, X_test):
     ).reshape(num_test, win_size, num_features)
 
     return X_train_scaled.astype(np.float32), X_test_scaled.astype(np.float32), scaler
+
+
+def split_windows(X, y, session_ids, cfg: Config):
+    if cfg.split_by_session:
+        unique_sessions = np.unique(session_ids)
+        if len(unique_sessions) >= 2:
+            gss = GroupShuffleSplit(n_splits=1, test_size=cfg.test_size, random_state=cfg.random_state)
+            train_idx, test_idx = next(gss.split(X, y, groups=session_ids))
+
+            y_train, y_test = y[train_idx], y[test_idx]
+            if len(np.unique(y_train)) >= 2 and len(np.unique(y_test)) >= 2:
+                print(
+                    f"Split strategy: grouped by session "
+                    f"(train sessions={len(np.unique(session_ids[train_idx]))}, "
+                    f"test sessions={len(np.unique(session_ids[test_idx]))})"
+                )
+                return X[train_idx], X[test_idx], y_train, y_test
+
+            print("Grouped split produced a single-class train/test set; falling back to stratified random split.")
+        else:
+            print("Not enough sessions for grouped split; falling back to stratified random split.")
+
+    return train_test_split(
+        X,
+        y,
+        test_size=cfg.test_size,
+        random_state=cfg.random_state,
+        stratify=y,
+    )
 
 # Computes class imbalance weight
 def compute_pos_weight(y_train, device):
@@ -278,10 +351,12 @@ def save_checkpoint(model, scaler, feature_columns, cfg, path):
     )
 
 # Prints basic dataset summary
-def print_data_summary(df, raw_y, event_y, X, y):
-    print(f"Loaded rows: {len(df)}")
-    print(f"Raw positive frames: {int(np.sum(raw_y == 1))}")
-    print(f"Collapsed tap events: {int(np.sum(event_y == 1))}")
+def print_data_summary(stats, X, y):
+    print(f"Loaded rows: {stats['num_rows']}")
+    print(f"Recording sessions: {stats['num_sessions']}")
+    print(f"Sessions with windows: {stats['sessions_with_windows']}")
+    print(f"Raw positive frames: {stats['raw_positive_frames']}")
+    print(f"Collapsed tap events: {stats['collapsed_tap_events']}")
     print(f"Created windows: {len(X)}")
     print(f"Window shape: {X.shape}")
     print(f"Positive windows: {int(np.sum(y == 1))}")
@@ -303,15 +378,23 @@ def build_dataloaders(X_train, X_test, y_train, y_test, batch_size):
 
     return train_loader, test_loader
 
-# Resolves a local CSV path
-def resolve_csv_path(user_path: str) -> str:
+# Resolves local CSV path(s)
+def resolve_csv_path(user_path: str):
     path = Path(user_path)
 
     if path.exists() and path.is_file():
-        return str(path)
+        if path.suffix.lower() != ".csv":
+            raise ValueError(f"Expected a CSV file, got: {path}")
+        return [str(path)]
+
+    if path.exists() and path.is_dir():
+        csv_files = sorted([str(p) for p in path.glob("*.csv") if p.is_file()])
+        if not csv_files:
+            raise FileNotFoundError(f"No CSV files found in directory: {user_path}")
+        return csv_files
 
     raise FileNotFoundError(
-        f"Could not find the CSV file at: {user_path}"
+        f"Could not find file or directory at: {user_path}"
     )
 
 # Builds config from command line arguments
@@ -327,11 +410,16 @@ def build_config():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--test_size", type=float, default=0.2)
     parser.add_argument("--save_path", type=str, default="best_1dcnn_tap.pt")
+    parser.set_defaults(split_by_session=True)
+    parser.add_argument("--split_by_session", dest="split_by_session", action="store_true",
+                        help="Split train/test by session_id groups (default)")
+    parser.add_argument("--no_split_by_session", dest="split_by_session", action="store_false",
+                        help="Disable grouped split and use stratified random split")
 
     args = parser.parse_args()
 
     return Config(
-        csv_path=resolve_csv_path(args.csv),
+        csv_path=args.csv,
         window_size=args.window_size,
         stride=args.stride,
         batch_size=args.batch_size,
@@ -340,6 +428,7 @@ def build_config():
         test_size=args.test_size,
         random_state=default_cfg.random_state,
         use_weighted_loss=default_cfg.use_weighted_loss,
+        split_by_session=args.split_by_session,
         save_path=args.save_path,
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -347,12 +436,14 @@ def build_config():
 # Prepares dataset and loaders
 def prepare_data(cfg: Config):
     print(f"Using device: {cfg.device}")
-    print(f"CSV path: {cfg.csv_path}")
+    csv_files = resolve_csv_path(cfg.csv_path)
+    print(f"CSV input: {cfg.csv_path}")
+    print(f"Loaded CSV files: {len(csv_files)}")
 
-    df = load_and_validate_csv(cfg.csv_path)
+    df = load_and_validate_csvs(csv_files)
     feature_columns = ["dist_raw", "dist_norm", "velocity", "accel", "hand_conf"]
 
-    X, y, raw_y, event_y = create_sliding_windows(
+    X, y, session_ids, stats = create_sliding_windows(
         df=df,
         feature_columns=feature_columns,
         label_column="label",
@@ -360,18 +451,15 @@ def prepare_data(cfg: Config):
         stride=cfg.stride
     )
 
-    print_data_summary(df, raw_y, event_y, X, y)
+    print_data_summary(stats, X, y)
+
+    if len(X) == 0:
+        raise ValueError("No windows were created. Increase session length or reduce window_size.")
 
     if len(np.unique(y)) < 2:
         raise ValueError("Window labels contain only one class, so training cannot proceed.")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=cfg.test_size,
-        random_state=cfg.random_state,
-        stratify=y
-    )
+    X_train, X_test, y_train, y_test = split_windows(X, y, session_ids, cfg)
 
     X_train, X_test, scaler = standardize_windows(X_train, X_test)
     train_loader, test_loader = build_dataloaders(
