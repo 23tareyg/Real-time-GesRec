@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import os
 import argparse
 
+print("debug")
+
 
 def plot_csv(csv_path, output_dir):
     df = pd.read_csv(csv_path)
