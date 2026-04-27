@@ -1,6 +1,7 @@
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import os
 
 import numpy as np
 import pandas as pd
@@ -18,11 +19,15 @@ from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
+# Path resolution
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_DEFAULT_CSV_DIR = _SCRIPT_DIR / "tap_data"
+_DEFAULT_MODEL_OUTPUT = _SCRIPT_DIR / "model_output" / "best_1dcnn_tap.pt"
+
 # Holds training configuration parameters
 @dataclass
 class Config:
-    # Update path to your path
-    csv_path: str = "./tap_data"
+    csv_path: str = str(_DEFAULT_CSV_DIR)
     window_size: int = 30
     stride: int = 1
     batch_size: int = 128
@@ -32,7 +37,7 @@ class Config:
     random_state: int = 4524
     use_weighted_loss: bool = True
     split_by_session: bool = True
-    save_path: str = "best_1dcnn_tap.pt"
+    save_path: str = str(_DEFAULT_MODEL_OUTPUT)
     device: str = "cpu"
 
 # Dataset for sliding window time series
@@ -58,6 +63,7 @@ class Tap1DCNN(nn.Module):
     def __init__(self, num_features: int):
         super().__init__()
 
+        # Block model: x -> y features, normalize conv, pass thru ReLU, halve time steps
         self.features = nn.Sequential(
             nn.Conv1d(num_features, 32, 3, padding=1),
             nn.BatchNorm1d(32),
@@ -81,7 +87,7 @@ class Tap1DCNN(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1) # this final output is a logit (-inf, inf)
         )
 
     # Runs a forward pass
@@ -90,7 +96,7 @@ class Tap1DCNN(nn.Module):
         x = self.classifier(x)
         return x.squeeze(1)
 
-# Loads and validates CSV data
+# Loads and validates single CSV data file, returns dataframe
 def load_and_validate_csv(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
 
@@ -110,7 +116,7 @@ def load_and_validate_csv(csv_path: str) -> pd.DataFrame:
         raise ValueError(f"Missing columns: {missing}")
 
     if "session_id" not in df.columns:
-        df["session_id"] = Path(csv_path).stem
+        df["session_id"] = Path(csv_path).stem # add filename as "session_id"
 
     df["session_id"] = df["session_id"].astype(str)
 
@@ -128,7 +134,7 @@ def load_and_validate_csv(csv_path: str) -> pd.DataFrame:
 
     return df
 
-
+# loads all csvs from multiple files if necessary
 def load_and_validate_csvs(csv_paths):
     frames = []
     for path in csv_paths:
@@ -188,7 +194,11 @@ def create_sliding_windows(df, feature_columns, label_column, window_size, strid
         for start in range(0, len(session_df) - window_size + 1, stride):
             end = start + window_size
             window_x = X[start:end]
-            window_y = 1 if np.any(event_y[start:end] == 1) else 0
+            
+            # Only label positive if the tap event is near the center of the window
+            center = window_size // 2
+            margin = 5  # frames of tolerance
+            window_y = 1 if np.any(event_y[start + center - margin : start + center + margin] == 1) else 0
 
             X_windows.append(window_x)
             y_windows.append(window_y)
@@ -409,7 +419,7 @@ def build_config():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--test_size", type=float, default=0.2)
-    parser.add_argument("--save_path", type=str, default="best_1dcnn_tap.pt")
+    parser.add_argument("--save_path", type=str, default=str(_DEFAULT_MODEL_OUTPUT))
     parser.set_defaults(split_by_session=True)
     parser.add_argument("--split_by_session", dest="split_by_session", action="store_true",
                         help="Split train/test by session_id groups (default)")

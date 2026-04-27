@@ -43,6 +43,8 @@ import sys
 import time
 import urllib.request
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -59,11 +61,16 @@ HAND_CONNECTIONS = [
 ]
 
 
+# Path resolution
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_WORKSPACE_ROOT = _SCRIPT_DIR.parent  # parent of 1D_CNN/
+_DEFAULT_TASK_MODEL_PATH = _WORKSPACE_ROOT / 'models' / 'hand_landmarker.task'
+
 DEFAULT_TASK_MODEL_URL = (
     'https://storage.googleapis.com/mediapipe-models/hand_landmarker/'
     'hand_landmarker/float16/1/hand_landmarker.task'
 )
-DEFAULT_TASK_MODEL_PATH = os.path.join('models', 'hand_landmarker.task')
+DEFAULT_TASK_MODEL_PATH = str(_DEFAULT_TASK_MODEL_PATH)
 
 
 # ── Landmark indices of interest ─────────────────────────────────────────────
@@ -235,6 +242,11 @@ def draw_overlay(frame, lm, h, w, dist_raw, dist_norm, vel, accel,
 
 def main():
     args = parse_args()
+
+    # Add timestamp to default output to prevent file overwrites
+    if args.out == 'tap_data.csv':
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.out = f'tap_data/tap_data_{timestamp}.csv'
 
     session_id = args.session_id
     if session_id is None or str(session_id).strip() == '':

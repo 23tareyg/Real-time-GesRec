@@ -46,6 +46,7 @@ import sys
 import time
 import urllib.request
 from collections import deque
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -72,11 +73,16 @@ HAND_CONNECTIONS = [
     (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)
 ]
 
+# Path resolution
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_WORKSPACE_ROOT = _SCRIPT_DIR.parent  # parent of 1D_CNN/
+_DEFAULT_TASK_MODEL_PATH = _WORKSPACE_ROOT / 'models' / 'hand_landmarker.task'
+
 DEFAULT_TASK_MODEL_URL = (
     'https://storage.googleapis.com/mediapipe-models/hand_landmarker/'
     'hand_landmarker/float16/1/hand_landmarker.task'
 )
-DEFAULT_TASK_MODEL_PATH = os.path.join('models', 'hand_landmarker.task')
+DEFAULT_TASK_MODEL_PATH = str(_DEFAULT_TASK_MODEL_PATH)
 
 
 # ── Model definition (must match 1dcnn.py) ───────────────────────────────────
