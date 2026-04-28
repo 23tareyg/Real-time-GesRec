@@ -1,7 +1,6 @@
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-import os
 
 import numpy as np
 import pandas as pd
@@ -18,6 +17,8 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
+
+from tap_model import FEATURE_COLUMNS, Tap1DCNN
 
 # Path resolution
 _SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -56,45 +57,6 @@ class TapWindowDataset(Dataset):
         x = self.X[idx].transpose(0, 1)
         y = self.y[idx]
         return x, y
-
-# 1D CNN model for tap classification
-class Tap1DCNN(nn.Module):
-    # Builds convolutional and linear layers
-    def __init__(self, num_features: int):
-        super().__init__()
-
-        # Block model: x -> y features, normalize conv, pass thru ReLU, halve time steps
-        self.features = nn.Sequential(
-            nn.Conv1d(num_features, 32, 3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(32, 64, 3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(64, 128, 3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-
-            nn.AdaptiveAvgPool1d(1)
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 1) # this final output is a logit (-inf, inf)
-        )
-
-    # Runs a forward pass
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x.squeeze(1)
 
 # Loads and validates single CSV data file, returns dataframe
 def load_and_validate_csv(csv_path: str) -> pd.DataFrame:
@@ -451,7 +413,7 @@ def prepare_data(cfg: Config):
     print(f"Loaded CSV files: {len(csv_files)}")
 
     df = load_and_validate_csvs(csv_files)
-    feature_columns = ["dist_raw", "dist_norm", "velocity", "accel", "hand_conf"]
+    feature_columns = FEATURE_COLUMNS
 
     X, y, session_ids, stats = create_sliding_windows(
         df=df,

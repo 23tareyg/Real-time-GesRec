@@ -52,13 +52,11 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 
 import mediapipe as mp
 
+from tap_model import FEATURE_COLUMNS, Tap1DCNN
 
-# ── Shared constants (must match collect_tap_data.py / 1dcnn.py) ─────────────
-FEATURE_COLUMNS = ["dist_raw", "dist_norm", "velocity", "accel", "hand_conf"]
 
 THUMB_TIP = 4
 INDEX_TIP = 8
@@ -83,42 +81,6 @@ DEFAULT_TASK_MODEL_URL = (
     'hand_landmarker/float16/1/hand_landmarker.task'
 )
 DEFAULT_TASK_MODEL_PATH = str(_DEFAULT_TASK_MODEL_PATH)
-
-
-# ── Model definition (must match 1dcnn.py) ───────────────────────────────────
-class Tap1DCNN(nn.Module):
-    def __init__(self, num_features: int):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv1d(num_features, 32, 3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(32, 64, 3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(64, 128, 3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-
-            nn.AdaptiveAvgPool1d(1),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 1),
-        )
-
-    def forward(self, x):
-        return self.features(x).pipe(self.classifier).squeeze(1) \
-            if False else self.classifier(self.features(x)).squeeze(1)
-
-
 # ── Checkpoint loading ────────────────────────────────────────────────────────
 class InferenceState:
     """Holds the loaded model, scaler parameters, and window config."""
@@ -359,7 +321,8 @@ def run_csv_mode(args, engine: TapInferenceEngine):
     """
     df = pd.read_csv(args.csv)
 
-    missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    feature_columns = engine.state.feature_columns
+    missing = [c for c in feature_columns if c not in df.columns]
     if missing:
         sys.exit(f'ERROR: CSV is missing columns: {missing}')
 
@@ -373,7 +336,7 @@ def run_csv_mode(args, engine: TapInferenceEngine):
         print(f'Ground-truth tap transitions in CSV: {gt_taps}')
 
     for row in df.itertuples(index=False):
-        fvec = np.array([getattr(row, c) for c in FEATURE_COLUMNS], dtype=np.float32)
+        fvec = np.array([getattr(row, c) for c in feature_columns], dtype=np.float32)
         tap_fired = engine.push(fvec)
 
         out_row = {
@@ -381,9 +344,10 @@ def run_csv_mode(args, engine: TapInferenceEngine):
             'prob':      round(engine.last_prob, 4),
             'pred':      engine.last_pred,
             'tap_count': engine.tap_count,
+            'tap_fired': int(tap_fired),
         }
         if has_gt:
-            out_row['gt_label'] = int(getattr(row, 'label', 0))
+            out_row['label'] = int(getattr(row, 'label', 0))
         if tap_fired:
             tap_frames.append(out_row['frame_idx'])
         out_rows.append(out_row)
@@ -394,12 +358,12 @@ def run_csv_mode(args, engine: TapInferenceEngine):
         _write_csv(args.out_csv, out_rows)
 
     if has_gt and out_rows:
-        gt_labels = np.array([r['gt_label'] for r in out_rows])
+        gt_labels = np.array([r['label'] for r in out_rows])
         pred_preds = np.array([r['pred']    for r in out_rows])
         _print_accuracy(gt_labels, pred_preds)
 
     if args.plot_conf and out_rows:
-        _plot_confidence(out_rows)
+        _plot_confidence(out_rows, source_csv=args.csv)
 
 
 # ── Live / video mode ─────────────────────────────────────────────────────────
@@ -573,20 +537,33 @@ def parse_args():
 
 
 
-def _plot_confidence(rows, out_path='airtap/outputs/confidence_plot.png'):
+def _plot_confidence(rows, out_path=None, source_csv=None):
     import matplotlib.pyplot as plt
-    import os
+
+    if out_path is None:
+        if source_csv:
+            src_path = Path(source_csv)
+            out_path = str(src_path.with_name(f'{src_path.stem}_conf_graph.png'))
+        else:
+            out_path = 'graphs/res.png'
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     frame_idxs = [r['frame_idx'] for r in rows]
     probs      = [r['prob'] for r in rows]
+    labels     = [r.get('label', r.get('gt_label')) for r in rows]
 
     plt.figure()
-    plt.plot(frame_idxs, probs)
+    plt.plot(frame_idxs, probs, label='Predicted prob', linewidth=1.5)
+    if any(v is not None for v in labels):
+        labels = [0 if v is None else int(v) for v in labels]
+        plt.step(frame_idxs, labels, where='post', label='Truth label (0/1)', linewidth=1.2, alpha=0.9)
+        plt.ylim(-0.05, 1.05)
     plt.xlabel('Frame Index')
-    plt.ylabel('Confidence (prob)')
-    plt.title('Confidence Over Frames')
+    plt.ylabel('Value')
+    plt.title('Predicted Confidence with Truth Overlay')
+    plt.legend(loc='upper right')
+    plt.grid(alpha=0.2)
 
     plt.savefig(out_path)
     plt.close()

@@ -51,6 +51,8 @@ import numpy as np
 
 import mediapipe as mp
 
+from tap_model import FEATURE_COLUMNS
+
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -398,8 +400,7 @@ def main():
 
     out_path = args.out
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    fieldnames = ['session_id', 'frame_idx', 'timestamp', 'dist_raw', 'dist_norm',
-                  'velocity', 'accel', 'hand_conf', 'label']
+    fieldnames = ['session_id', 'frame_idx', 'timestamp', *FEATURE_COLUMNS, 'label']
     with open(out_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
