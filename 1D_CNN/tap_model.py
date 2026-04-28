@@ -1,7 +1,17 @@
 import torch.nn as nn
 
 
-FEATURE_COLUMNS = ["dist_raw", "dist_norm", "velocity", "accel", "hand_conf"]
+FEATURE_COLUMNS = [
+    "dist_raw",
+    "dist_norm",
+    "velocity",
+    "accel",
+    "hand_conf",
+    "thumb_x_pos",
+    "thumb_y_pos",
+    "pointer_x_pos",
+    "pointer_y_pos",
+]
 
 
 class Tap1DCNN(nn.Module):

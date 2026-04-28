@@ -248,7 +248,7 @@ def select_hand(results, preference: str):
     return None, None
 
 
-def extract_features(lm, w: int, h: int, dist_norm_hist: deque) -> np.ndarray:
+def extract_features(lm, w: int, h: int, dist_norm_hist: deque) -> dict:
     """Compute one feature vector from a MediaPipe landmark list."""
     thumb     = lm[THUMB_TIP]
     index_tip = lm[INDEX_TIP]
@@ -264,7 +264,17 @@ def extract_features(lm, w: int, h: int, dist_norm_hist: deque) -> np.ndarray:
     accel = ((dist_norm_hist[-1] - dist_norm_hist[-2]) -
              (dist_norm_hist[-2] - dist_norm_hist[-3])) if len(dist_norm_hist) >= 3 else 0.0
 
-    return np.array([dist_raw, dist_norm, vel, accel, 0.0], dtype=np.float32)
+    return {
+        "dist_raw": float(dist_raw),
+        "dist_norm": float(dist_norm),
+        "velocity": float(vel),
+        "accel": float(accel),
+        "hand_conf": 0.0,
+        "thumb_x_pos": float(thumb.x),
+        "thumb_y_pos": float(thumb.y),
+        "pointer_x_pos": float(index_tip.x),
+        "pointer_y_pos": float(index_tip.y),
+    }
 
 
 # ── Drawing helpers ───────────────────────────────────────────────────────────
@@ -407,8 +417,12 @@ def run_video_mode(args, engine: TapInferenceEngine):
 
         tap_fired = False
         if lm is not None:
-            fvec         = extract_features(lm, w, h, dist_norm_hist)
-            fvec[4]      = float(hand_conf)   # fill hand_conf slot
+            feature_map  = extract_features(lm, w, h, dist_norm_hist)
+            feature_map["hand_conf"] = float(hand_conf)
+            fvec         = np.array(
+                [feature_map.get(c, 0.0) for c in engine.state.feature_columns],
+                dtype=np.float32,
+            )
             tap_fired    = engine.push(fvec)
             draw_skeleton(frame, lm, w, h)
 

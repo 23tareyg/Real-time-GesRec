@@ -62,16 +62,7 @@ class TapWindowDataset(Dataset):
 def load_and_validate_csv(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
 
-    required_columns = [
-        "frame_idx",
-        "timestamp",
-        "dist_raw",
-        "dist_norm",
-        "velocity",
-        "accel",
-        "hand_conf",
-        "label",
-    ]
+    required_columns = ["frame_idx", "timestamp", *FEATURE_COLUMNS, "label"]
 
     missing = [col for col in required_columns if col not in df.columns]
     if missing:
@@ -257,7 +248,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 
 # Evaluates model performance
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, threshold=0.5):
+def evaluate(model, loader, criterion, device, threshold=0.7):
     model.eval()
     total_loss = 0.0
 

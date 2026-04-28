@@ -340,6 +340,10 @@ def main():
 
         dist_raw  = 0.0
         dist_norm = 0.0
+        thumb_x_pos = 0.0
+        thumb_y_pos = 0.0
+        pointer_x_pos = 0.0
+        pointer_y_pos = 0.0
 
         if lm is not None:
             thumb     = lm[THUMB_TIP]
@@ -350,6 +354,10 @@ def main():
             dist_raw  = _dist(thumb, index_tip, w, h)
             palm_size = _dist(wrist, mid_mcp, w, h)
             dist_norm = dist_raw / palm_size if palm_size > 1e-6 else 0.0
+            thumb_x_pos = float(thumb.x)
+            thumb_y_pos = float(thumb.y)
+            pointer_x_pos = float(index_tip.x)
+            pointer_y_pos = float(index_tip.y)
 
             hist.append(dist_norm)
             if len(hist) >= 2:
@@ -375,6 +383,10 @@ def main():
                 'velocity':   round(vel,        6),
                 'accel':      round(accel,       6),
                 'hand_conf':  round(float(hand_conf), 4),
+                'thumb_x_pos': round(thumb_x_pos, 6),
+                'thumb_y_pos': round(thumb_y_pos, 6),
+                'pointer_x_pos': round(pointer_x_pos, 6),
+                'pointer_y_pos': round(pointer_y_pos, 6),
                 'label':      label,
             })
 
