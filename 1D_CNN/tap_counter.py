@@ -398,6 +398,9 @@ def run_csv_mode(args, engine: TapInferenceEngine):
         pred_preds = np.array([r['pred']    for r in out_rows])
         _print_accuracy(gt_labels, pred_preds)
 
+    if args.plot_conf and out_rows:
+        _plot_confidence(out_rows)
+
 
 # ── Live / video mode ─────────────────────────────────────────────────────────
 def run_video_mode(args, engine: TapInferenceEngine):
@@ -496,6 +499,9 @@ def run_video_mode(args, engine: TapInferenceEngine):
     if args.out_csv and out_rows:
         _write_csv(args.out_csv, out_rows)
 
+    if args.plot_conf and out_rows:
+        _plot_confidence(out_rows)
+
 
 # ── Utility ───────────────────────────────────────────────────────────────────
 def _write_csv(path: str, rows: list):
@@ -560,7 +566,32 @@ def parse_args():
     p.add_argument('--out_csv', default=None,
                    help='Optional path to save per-frame inference results')
 
+    p.add_argument('--plot_conf', action='store_true',
+               help='Plot confidence over frames after run')
+
     return p.parse_args()
+
+
+
+def _plot_confidence(rows, out_path='airtap/outputs/confidence_plot.png'):
+    import matplotlib.pyplot as plt
+    import os
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    frame_idxs = [r['frame_idx'] for r in rows]
+    probs      = [r['prob'] for r in rows]
+
+    plt.figure()
+    plt.plot(frame_idxs, probs)
+    plt.xlabel('Frame Index')
+    plt.ylabel('Confidence (prob)')
+    plt.title('Confidence Over Frames')
+
+    plt.savefig(out_path)
+    plt.close()
+
+    print(f'Saved confidence plot → {out_path}')
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
