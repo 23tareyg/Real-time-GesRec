@@ -10,6 +10,7 @@ from sklearn.metrics import (
     accuracy_score,
     classification_report,
     confusion_matrix,
+    fbeta_score,
     f1_score,
     precision_score,
     recall_score,
@@ -38,6 +39,7 @@ class Config:
     random_state: int = 4524
     use_weighted_loss: bool = True
     split_by_session: bool = True
+    group_k_folds: int = 1
     save_path: str = str(_DEFAULT_MODEL_OUTPUT)
     device: str = "cpu"
 
@@ -299,8 +301,35 @@ def print_epoch_metrics(epoch, train_loss, val_loss, val):
         f"Val F1: {val['f1']:.4f}"
     )
 
+
+def find_best_threshold(y_true, y_prob, min_threshold=0.5, max_threshold=0.90, step=0.01, beta=0.8):
+    thresholds = np.arange(min_threshold, max_threshold + 1e-12, step)
+
+    best_threshold = min_threshold
+    best_score = -1.0
+    best_precision = 0.0
+    best_recall = 0.0
+
+    for threshold in thresholds:
+        y_pred = (y_prob >= threshold).astype(np.float32)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        score = fbeta_score(y_true, y_pred, beta=beta, zero_division=0)
+
+        if (
+            score > best_score
+            or (np.isclose(score, best_score) and precision > best_precision)
+            or (np.isclose(score, best_score) and np.isclose(precision, best_precision) and recall > best_recall)
+        ):
+            best_threshold = float(threshold)
+            best_score = float(score)
+            best_precision = float(precision)
+            best_recall = float(recall)
+
+    return best_threshold, best_score, best_precision, best_recall
+
 # Saves the best model checkpoint
-def save_checkpoint(model, scaler, feature_columns, cfg, path):
+def save_checkpoint(model, scaler, feature_columns, cfg, path, best_threshold=0.7):
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -309,6 +338,7 @@ def save_checkpoint(model, scaler, feature_columns, cfg, path):
             "stride": cfg.stride,
             "scaler_mean": scaler.mean_,
             "scaler_scale": scaler.scale_,
+            "best_threshold": best_threshold,
         },
         path,
     )
@@ -372,6 +402,8 @@ def build_config():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--test_size", type=float, default=0.2)
+    parser.add_argument("--group_k_folds", type=int, default=1,
+                        help="Number of GroupKFold splits by session_id (set >1 to enable CV)")
     parser.add_argument("--save_path", type=str, default=str(_DEFAULT_MODEL_OUTPUT))
     parser.set_defaults(split_by_session=True)
     parser.add_argument("--split_by_session", dest="split_by_session", action="store_true",
@@ -392,12 +424,13 @@ def build_config():
         random_state=default_cfg.random_state,
         use_weighted_loss=default_cfg.use_weighted_loss,
         split_by_session=args.split_by_session,
+        group_k_folds=args.group_k_folds,
         save_path=args.save_path,
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
 
-# Prepares dataset and loaders
-def prepare_data(cfg: Config):
+
+def load_window_data(cfg: Config):
     print(f"Using device: {cfg.device}")
     csv_files = resolve_csv_path(cfg.csv_path)
     print(f"CSV input: {cfg.csv_path}")
@@ -422,6 +455,12 @@ def prepare_data(cfg: Config):
     if len(np.unique(y)) < 2:
         raise ValueError("Window labels contain only one class, so training cannot proceed.")
 
+    return X, y, session_ids, feature_columns
+
+# Prepares dataset and loaders
+def prepare_data(cfg: Config):
+    X, y, session_ids, feature_columns = load_window_data(cfg)
+
     X_train, X_test, y_train, y_test = split_windows(X, y, session_ids, cfg)
 
     X_train, X_test, scaler = standardize_windows(X_train, X_test)
@@ -430,6 +469,88 @@ def prepare_data(cfg: Config):
     )
 
     return train_loader, test_loader, scaler, feature_columns, y_train
+
+
+def run_group_kfold(cfg: Config):
+    from sklearn.model_selection import GroupKFold
+
+    X, y, session_ids, feature_columns = load_window_data(cfg)
+    unique_sessions = np.unique(session_ids)
+
+    if not cfg.split_by_session:
+        raise ValueError("Group K-fold requires --split_by_session.")
+
+    if cfg.group_k_folds < 2:
+        raise ValueError("group_k_folds must be >= 2 for GroupKFold.")
+
+    if len(unique_sessions) < cfg.group_k_folds:
+        raise ValueError(
+            f"Need at least {cfg.group_k_folds} unique sessions, but found {len(unique_sessions)}."
+        )
+
+    gkf = GroupKFold(n_splits=cfg.group_k_folds)
+    fold_metrics = []
+    original_save_path = cfg.save_path
+
+    print(f"\nRunning GroupKFold with {cfg.group_k_folds} folds (session-wise split)")
+
+    for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups=session_ids), start=1):
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+            print(f"Fold {fold_idx}: skipped (single-class train/test set)")
+            continue
+
+        print(
+            f"\nFold {fold_idx}/{cfg.group_k_folds} | "
+            f"train sessions={len(np.unique(session_ids[train_idx]))}, "
+            f"test sessions={len(np.unique(session_ids[test_idx]))}"
+        )
+
+        X_train, X_test, scaler = standardize_windows(X[train_idx], X[test_idx])
+        train_loader, test_loader = build_dataloaders(
+            X_train, X_test, y_train, y_test, cfg.batch_size
+        )
+
+        model, criterion, optimizer = build_training_components(cfg, len(feature_columns), y_train)
+
+        fold_save_path = str(Path(original_save_path).with_name(
+            f"{Path(original_save_path).stem}_fold{fold_idx}{Path(original_save_path).suffix}"
+        ))
+        cfg.save_path = fold_save_path
+
+        run_training(model, train_loader, test_loader, criterion, optimizer, scaler, feature_columns, cfg)
+
+        ckpt = torch.load(cfg.save_path, map_location=cfg.device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        best_threshold = float(ckpt.get("best_threshold", 0.7))
+
+        final = evaluate(model, test_loader, criterion, cfg.device, threshold=best_threshold)
+        fold_metrics.append(
+            {
+                "accuracy": final["accuracy"],
+                "precision": final["precision"],
+                "recall": final["recall"],
+                "f1": final["f1"],
+                "threshold": best_threshold,
+            }
+        )
+
+        print(
+            f"Fold {fold_idx} Final | Threshold: {best_threshold:.2f} | "
+            f"Acc: {final['accuracy']:.4f} | Prec: {final['precision']:.4f} | "
+            f"Rec: {final['recall']:.4f} | F1: {final['f1']:.4f}"
+        )
+
+    cfg.save_path = original_save_path
+
+    if not fold_metrics:
+        raise ValueError("No valid folds were evaluated. Check class balance per session.")
+
+    print("\nGroupKFold Summary")
+    for metric_name in ["accuracy", "precision", "recall", "f1", "threshold"]:
+        values = np.array([m[metric_name] for m in fold_metrics], dtype=np.float32)
+        print(f"{metric_name.capitalize():>9}: {values.mean():.4f} ± {values.std(ddof=0):.4f}")
 
 # Builds model, loss, and optimizer
 def build_training_components(cfg: Config, num_features: int, y_train):
@@ -449,23 +570,44 @@ def build_training_components(cfg: Config, num_features: int, y_train):
 
 # Trains the model across all epochs
 def run_training(model, train_loader, test_loader, criterion, optimizer, scaler, feature_columns, cfg: Config):
-    best_f1 = -1.0
+    best_f05 = -1.0
+    early_stopping_patience = 3
+    min_delta = 1e-4
+    epochs_without_improve = 0
 
     for epoch in range(1, cfg.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, cfg.device)
         val = evaluate(model, test_loader, criterion, cfg.device)
+        best_threshold, val_f05, val_precision_tuned, val_recall_tuned = find_best_threshold(
+            val["y_true"],
+            val["y_prob"],
+            min_threshold=0.5,
+        )
         print_epoch_metrics(epoch, train_loss, val["loss"], val)
+        print(
+            f"  Threshold sweep [0.50-0.95] -> best={best_threshold:.2f} | "
+            f"Val Precision: {val_precision_tuned:.4f} | "
+            f"Val Recall: {val_recall_tuned:.4f} | "
+            f"Val F0.5: {val_f05:.4f}"
+        )
 
-        if val["f1"] > best_f1:
-            best_f1 = val["f1"]
-            save_checkpoint(model, scaler, feature_columns, cfg, cfg.save_path)
-            print(f"Saved best model to {cfg.save_path}")
+        if val_f05 > best_f05 + min_delta:
+            best_f05 = val_f05
+            epochs_without_improve = 0
+            save_checkpoint(model, scaler, feature_columns, cfg, cfg.save_path, best_threshold=best_threshold)
+            print(f"Saved best model to {cfg.save_path} (threshold={best_threshold:.2f})")
+        else:
+            epochs_without_improve += 1
+            if epochs_without_improve >= early_stopping_patience:
+                print(f"Early stopping at epoch {epoch:02d} (best Val F0.5: {best_f05:.4f})")
+                break
 
 # Prints final evaluation results
-def print_final_results(model, test_loader, criterion, cfg: Config):
-    final = evaluate(model, test_loader, criterion, cfg.device)
+def print_final_results(model, test_loader, criterion, cfg: Config, threshold=0.7):
+    final = evaluate(model, test_loader, criterion, cfg.device, threshold=threshold)
 
     print("\nFinal Results")
+    print(f"Threshold: {threshold:.2f}")
     print(f"Accuracy:  {final['accuracy']:.4f}")
     print(f"Precision: {final['precision']:.4f}")
     print(f"Recall:    {final['recall']:.4f}")
@@ -480,10 +622,21 @@ def print_final_results(model, test_loader, criterion, cfg: Config):
 # Run the training pipeline
 def main():
     cfg = build_config()
+
+    if cfg.group_k_folds > 1:
+        run_group_kfold(cfg)
+        return
+
     train_loader, test_loader, scaler, feature_columns, y_train = prepare_data(cfg)
     model, criterion, optimizer = build_training_components(cfg, len(feature_columns), y_train)
     run_training(model, train_loader, test_loader, criterion, optimizer, scaler, feature_columns, cfg)
-    print_final_results(model, test_loader, criterion, cfg)
+
+    # Load best checkpoint before final evaluation
+    ckpt = torch.load(cfg.save_path, map_location=cfg.device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    best_threshold = float(ckpt.get("best_threshold", 0.7))
+    
+    print_final_results(model, test_loader, criterion, cfg, threshold=best_threshold)
 
 if __name__ == "__main__":
     main()
